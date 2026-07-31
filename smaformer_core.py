@@ -25,7 +25,7 @@ import torch.nn as nn
 from einops import rearrange
 from torch.nn import Softmax
 import torch.nn.functional as F
-
+from torch.nn.attention import sdpa_kernel, SDPBackend
 class SDPAMultiheadAttention(nn.Module):
     def __init__(self, embed_dim: int, num_heads: int, dropout: float = 0.0):
         super().__init__()
@@ -44,14 +44,17 @@ class SDPAMultiheadAttention(nn.Module):
         B, Lq, C = query.shape
         Lk = key.shape[1]
 
-        q = self.q_proj(query).view(B, Lq, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(key).view(B, Lk, self.num_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(value).view(B, Lk, self.num_heads, self.head_dim).transpose(1, 2)
+        # Add .contiguous() to prevent silent fallback to naive math backend
+        q = self.q_proj(query).view(B, Lq, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+        k = self.k_proj(key).view(B, Lk, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+        v = self.v_proj(value).view(B, Lk, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
 
-        attn_out = F.scaled_dot_product_attention(
-            q, k, v,
-            dropout_p=self.dropout if self.training else 0.0,
-        ) 
+        # Restrict allowlist to memory-efficient attention
+        with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.FLASH_ATTENTION]):
+            attn_out = F.scaled_dot_product_attention(
+                q, k, v,
+                dropout_p=self.dropout if self.training else 0.0,
+            )
 
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, Lq, C)
         out = self.out_proj(attn_out)
