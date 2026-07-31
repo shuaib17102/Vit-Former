@@ -156,14 +156,23 @@ def train_one_epoch(model, loader, optimizer, scaler, criterion, device, accumul
 
     for step, (imgs, masks) in enumerate(loader):
         imgs, masks = imgs.to(device, non_blocking=True), masks.to(device, non_blocking=True)
-        with autocast(device_type="cuda" if device.type == "cuda" else "cpu"):
+        
+        # Explicit fp16 for T4 Tensor Cores
+        with autocast(device_type="cuda" if device.type == "cuda" else "cpu", dtype=torch.float16):
             logits = model(imgs)
             loss = criterion(logits, masks) / accumulation_steps
+            
         scaler.scale(loss).backward()
+        
         if (step + 1) % accumulation_steps == 0:
+            # Unscale before gradient clipping
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
+            
         running_loss += loss.item() * accumulation_steps
     return running_loss / len(loader)
 
