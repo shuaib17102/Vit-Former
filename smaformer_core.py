@@ -24,7 +24,38 @@ import torch
 import torch.nn as nn
 from einops import rearrange
 from torch.nn import Softmax
+import torch.nn.functional as F
 
+class SDPAMultiheadAttention(nn.Module):
+    def __init__(self, embed_dim: int, num_heads: int, dropout: float = 0.0):
+        super().__init__()
+        assert embed_dim % num_heads == 0, f"embed_dim ({embed_dim}) must be divisible by num_heads ({num_heads})"
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.dropout = dropout
+
+        self.q_proj = nn.Linear(embed_dim, embed_dim)
+        self.k_proj = nn.Linear(embed_dim, embed_dim)
+        self.v_proj = nn.Linear(embed_dim, embed_dim)
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+
+    def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor):
+        B, Lq, C = query.shape
+        Lk = key.shape[1]
+
+        q = self.q_proj(query).view(B, Lq, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(key).view(B, Lk, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(value).view(B, Lk, self.num_heads, self.head_dim).transpose(1, 2)
+
+        attn_out = F.scaled_dot_product_attention(
+            q, k, v,
+            dropout_p=self.dropout if self.training else 0.0,
+        ) 
+
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, Lq, C)
+        out = self.out_proj(attn_out)
+        return out, None
 
 class RowAttention(nn.Module):
     """Unused by SMAFormer.forward (kept for parity with the original file)."""
@@ -193,7 +224,7 @@ class Modulator(nn.Module):
 class SMA(nn.Module):
     def __init__(self, feature_size, num_heads, dropout):
         super(SMA, self).__init__()
-        self.attention = nn.MultiheadAttention(embed_dim=feature_size, num_heads=num_heads, dropout=dropout, batch_first=True)
+        self.attention = SDPAMultiheadAttention(feature_size, num_heads, dropout)
         self.combined_modulator = Modulator(feature_size, feature_size)
         self.dropout = nn.Dropout(dropout) if dropout > 0. else nn.Identity()
 
@@ -209,7 +240,7 @@ class SMA(nn.Module):
 class MSA(nn.Module):
     def __init__(self, feature_size, num_heads, dropout):
         super(MSA, self).__init__()
-        self.attention = nn.MultiheadAttention(embed_dim=feature_size, num_heads=num_heads, dropout=dropout, batch_first=True)
+        self.attention = SDPAMultiheadAttention(feature_size, num_heads, dropout)
         self.combined_modulator = Modulator(feature_size, feature_size)
 
     def forward(self, value, key, query):
