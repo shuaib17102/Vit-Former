@@ -40,7 +40,7 @@ class SMAFormerBaseline(SMAFormer):
         self.vit_branch = ViTBottleneckBranch(
             vit_name=vit_name,
             img_size=img_size,
-            target_grid=32,            # matches this SMAFormer's bottleneck grid at 512 input
+            target_grid=img_size // 32,            # matches this SMAFormer's bottleneck grid at 512 input
             target_ch=self.filters[5], # 512
             pretrained=pretrained_vit,
             freeze_blocks=freeze_vit_blocks,
@@ -64,7 +64,7 @@ class SMAFormerBaseline(SMAFormer):
         self.vit_branch = ViTBottleneckBranch(
             vit_name=name,
             img_size=self.img_size,
-            target_grid=32,
+            target_grid=img_size // 32,
             target_ch=self.filters[5],
             pretrained=True,
             freeze_blocks=freeze,
