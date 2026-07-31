@@ -113,7 +113,7 @@ class SMAFormerBaseline(SMAFormer):
         e3 = e3.view(b, c, h * w).contiguous().permute(0, 2, 1)
         x6 = self.DecoderBlock2(x6, e3)
         b, hw, c = x6.size()
-        h = w = math.isqrt(hw))
+        h = w = math.isqrt(hw)
         x6 = x6.permute(0, 2, 1).contiguous().view(b, c, h, w)
 
         x7 = self.upsample_transpose2(x6)
@@ -141,7 +141,7 @@ class SMAFormerBaseline(SMAFormer):
         e1 = e1.view(b_e1, c_e1, h_e1 * w_e1).contiguous().permute(0, 2, 1)
         x8 = self.DecoderBlock4(x8, e1)
         b, hw, c = x8.size()
-        h = w = math.isqrt(hw))
+        h = w = math.isqrt(hw)
         x8 = x8.permute(0, 2, 1).contiguous().view(b, c, h, w)
         x8 = self.upsample_transpose6(x8)
 
