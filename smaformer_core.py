@@ -44,22 +44,36 @@ class SDPAMultiheadAttention(nn.Module):
         B, Lq, C = query.shape
         Lk = key.shape[1]
 
-        # Add .contiguous() to prevent silent fallback to naive math backend
+        # Force contiguous memory
         q = self.q_proj(query).view(B, Lq, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
         k = self.k_proj(key).view(B, Lk, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
         v = self.v_proj(value).view(B, Lk, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
 
-        # Restrict allowlist to memory-efficient attention
+        # Claude's Fix: Pad head_dim up to the next multiple of 8 for kernel compatibility
+        pad = (-self.head_dim) % 8
+        if pad > 0:
+            q = F.pad(q, (0, pad))
+            k = F.pad(k, (0, pad))
+            v = F.pad(v, (0, pad))
+
+        # Critical: Explicitly scale by the original head_dim so temperature doesn't change
+        scale = 1.0 / math.sqrt(self.head_dim)
+
+        # Strict allowlist: EFFICIENT and FLASH only. NO MATH backend allowed.
         with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.FLASH_ATTENTION]):
             attn_out = F.scaled_dot_product_attention(
                 q, k, v,
                 dropout_p=self.dropout if self.training else 0.0,
+                scale=scale
             )
+
+        # Slice off the padded columns to return to the original architecture dimensions
+        if pad > 0:
+            attn_out = attn_out[..., :self.head_dim]
 
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, Lq, C)
         out = self.out_proj(attn_out)
         return out, None
-
 class RowAttention(nn.Module):
     """Unused by SMAFormer.forward (kept for parity with the original file)."""
 
