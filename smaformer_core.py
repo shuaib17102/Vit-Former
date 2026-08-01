@@ -248,7 +248,7 @@ class SMA(nn.Module):
     def forward(self, value, key, query):
         MSA = self.attention(query, key, value)[0]
         batch_size, seq_len, feature_size = MSA.shape
-        MSA = MSA.permute(0, 2, 1).view(batch_size, feature_size, int(seq_len ** 0.5), int(seq_len ** 0.5))
+        MSA = MSA.permute(0, 2, 1).view(batch_size, feature_size, math.isqrt(seq_len), math.isqrt(seq_len))
         synergistic_attn = self.combined_modulator.forward(MSA)
         x = synergistic_attn.view(batch_size, feature_size, -1).permute(0, 2, 1)
         return x
@@ -485,13 +485,13 @@ class SMAFormer(nn.Module):
         x2 = self.patch_embedding1.PE(x1)
         e1 = self.EncoderBlock1(x2, x2)
         b, num_patch, c = e1.size()
-        x2 = e1.view(b, c, int(num_patch ** 0.5), int(num_patch ** 0.5))
+        x2 = e1.view(b, c, math.isqrt(num_patch), math.isqrt(num_patch))
         x2 = self.residual_conv1(x2)
 
         x3 = self.patch_embedding2.PE(x2)
         e2 = self.EncoderBlock2(x3, x3)
         b, num_patch, c = e2.size()
-        e2 = e2.view(b, c, num_patch // self.filters[2], num_patch // self.filters[2])
+        e2 = e2.view(b, c, math.isqrt(num_patch), math.isqrt(num_patch))
         x3 = self.residual_conv2(e2)
 
         x4 = self.patch_embedding3.PE(x3)
@@ -500,20 +500,20 @@ class SMAFormer(nn.Module):
 
         x5 = self.DecoderBlock1(e4, e4)
         b, hw, c = x5.size()
-        h = w = int(hw ** 0.5)
+        h = w = math.isqrt(hw)
         x5 = x5.contiguous().permute(0, 2, 1).view(b, c, h, w)
         x6 = self.upsample_transpose1(x5)
         x6 = torch.cat([x6, x3], dim=1)
         b, c, h, w = x6.size()
         x6 = x6.view(b, c, h * w).contiguous().permute(0, 2, 1)
         b, num_patch, c = e3.size()
-        e3 = e3.view(b, c, int(num_patch ** 0.5), int(num_patch ** 0.5))
+        e3 = e3.view(b, c, math.isqrt(num_patch), math.isqrt(num_patch))
         e3 = self.upsample(e3)
         b, c, h, w = e3.size()
         e3 = e3.view(b, c, h * w).contiguous().permute(0, 2, 1)
         x6 = self.DecoderBlock2(x6, e3)
         b, hw, c = x6.size()
-        h = w = int(hw ** 0.5)
+        h = w = math.isqrt(hw)
         x6 = x6.permute(0, 2, 1).contiguous().view(b, c, h, w)
 
         x7 = self.upsample_transpose2(x6)
@@ -525,7 +525,7 @@ class SMAFormer(nn.Module):
         e2 = e2.view(b, c, h * w).contiguous().permute(0, 2, 1)
         x7 = self.DecoderBlock3(x7, e2)
         b, hw, c = x7.size()
-        h = w = int(hw ** 0.5)
+        h = w = math.isqrt(hw)
         x7 = x7.permute(0, 2, 1).contiguous().view(b, c, h, w)
 
         x8 = self.upsample_transpose4(x7)
@@ -534,14 +534,14 @@ class SMAFormer(nn.Module):
         b, c, h, w = x8.size()
         x8 = x8.view(b, c, h * w).contiguous().permute(0, 2, 1)
         b_e1, hw_e1, c_e1 = e1.size()
-        h_e1 = w_e1 = int(hw_e1 ** 0.5)
+        h_e1 = w_e1 = math.isqrt(hw_e1)
         e1 = e1.permute(0, 2, 1).contiguous().view(b_e1, c_e1, h_e1, w_e1)
         e1 = self.adjust(e1)
         b_e1, c_e1, h_e1, w_e1 = e1.size()
         e1 = e1.view(b_e1, c_e1, h_e1 * w_e1).contiguous().permute(0, 2, 1)
         x8 = self.DecoderBlock4(x8, e1)
         b, hw, c = x8.size()
-        h = w = int(hw ** 0.5)
+        h = w = math.isqrt(hw)
         x8 = x8.permute(0, 2, 1).contiguous().view(b, c, h, w)
         x8 = self.upsample_transpose6(x8)
 
