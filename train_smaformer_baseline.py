@@ -174,6 +174,15 @@ def train_one_epoch(model, loader, optimizer, scaler, criterion, device, accumul
             optimizer.zero_grad(set_to_none=True)
             
         running_loss += loss.item() * accumulation_steps
+
+    # FLUSH: Process any remaining gradients at the end of the epoch
+    if len(loader) % accumulation_steps != 0:
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad(set_to_none=True)
+
     return running_loss / len(loader)
 
 @torch.no_grad()
@@ -183,7 +192,7 @@ def validate(model, loader, criterion, device, threshold=0.5):
     agg = {"dice": 0.0, "iou": 0.0, "precision": 0.0, "recall": 0.0}
     for imgs, masks in loader:
         imgs, masks = imgs.to(device), masks.to(device)
-        with autocast(device_type="cuda" if device.type == "cuda" else "cpu"):
+        with autocast(device_type="cuda" if device.type == "cuda" else "cpu", dtype=torch.float16):
             logits = model(imgs)
             loss = criterion(logits, masks)
         running_loss += loss.item()
