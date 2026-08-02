@@ -26,6 +26,7 @@ from einops import rearrange
 from torch.nn import Softmax
 import torch.nn.functional as F
 from torch.nn.attention import sdpa_kernel, SDPBackend
+
 class SDPAMultiheadAttention(nn.Module):
     def __init__(self, embed_dim: int, num_heads: int, dropout: float = 0.0):
         super().__init__()
@@ -74,6 +75,7 @@ class SDPAMultiheadAttention(nn.Module):
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, Lq, C)
         out = self.out_proj(attn_out)
         return out, None
+
 class RowAttention(nn.Module):
     """Unused by SMAFormer.forward (kept for parity with the original file)."""
 
@@ -106,7 +108,6 @@ class RowAttention(nn.Module):
         out = self.gamma * out + x
         return out
 
-
 class ColAttention(nn.Module):
     """Unused by SMAFormer.forward (kept for parity with the original file)."""
 
@@ -138,7 +139,6 @@ class ColAttention(nn.Module):
         out = out.view(b, w, -1, h).permute(0, 2, 3, 1)
         out = self.gamma * out + x
         return out
-
 
 class Modulator(nn.Module):
     def __init__(self, in_ch, out_ch, with_pos=True):
@@ -237,7 +237,6 @@ class Modulator(nn.Module):
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
 
-
 class SMA(nn.Module):
     def __init__(self, feature_size, num_heads, dropout):
         super(SMA, self).__init__()
@@ -253,7 +252,6 @@ class SMA(nn.Module):
         x = synergistic_attn.view(batch_size, feature_size, -1).permute(0, 2, 1)
         return x
 
-
 class MSA(nn.Module):
     def __init__(self, feature_size, num_heads, dropout):
         super(MSA, self).__init__()
@@ -263,7 +261,6 @@ class MSA(nn.Module):
     def forward(self, value, key, query):
         attention = self.attention(query, key, value)[0]
         return attention
-
 
 class E_MLP(nn.Module):
     def __init__(self, feature_size, forward_expansion, dropout):
@@ -300,7 +297,6 @@ class E_MLP(nn.Module):
         out = self.linear2(x)
         return out
 
-
 class SMAFormerBlock(nn.Module):
     def __init__(self, ch_in, ch_out, heads, dropout, forward_expansion, fusion_gate):
         super(SMAFormerBlock, self).__init__()
@@ -322,7 +318,6 @@ class SMAFormerBlock(nn.Module):
         out = self.dropout(self.norm2(feed_forward + query))
         return out
 
-
 class EncoderBlock(nn.Module):
     def __init__(self, in_ch, out_ch, heads, dropout, forward_expansion, num_layers, fusion_gate):
         super(EncoderBlock, self).__init__()
@@ -336,7 +331,6 @@ class EncoderBlock(nn.Module):
         for layer in self.layers:
             x = layer(res, res, x, x)
         return x
-
 
 class DecoderBlock(nn.Module):
     def __init__(self, in_ch, out_ch, heads, dropout, forward_expansion, num_layers, fusion_gate):
@@ -352,7 +346,6 @@ class DecoderBlock(nn.Module):
             x = layer(res, res, x, x)
         return x
 
-
 class Upsample_(nn.Module):
     def __init__(self, scale=2):
         super(Upsample_, self).__init__()
@@ -360,7 +353,6 @@ class Upsample_(nn.Module):
 
     def forward(self, x):
         return self.upsample(x)
-
 
 class ResidualConv(nn.Module):
     def __init__(self, input_dim, output_dim, stride, padding):
@@ -381,7 +373,6 @@ class ResidualConv(nn.Module):
     def forward(self, x):
         return self.conv_block(x) + self.conv_skip(x)
 
-
 class Upsample_Transpose(nn.Module):
     def __init__(self, input_dim, output_dim, kernel, stride):
         super(Upsample_Transpose, self).__init__()
@@ -389,7 +380,6 @@ class Upsample_Transpose(nn.Module):
 
     def forward(self, x):
         return self.upsample(x)
-
 
 class Cross_AttentionBlock(nn.Module):
     def __init__(self, input_encoder, input_decoder, output_dim):
@@ -414,7 +404,6 @@ class Cross_AttentionBlock(nn.Module):
         out = self.conv_encoder(x1) + self.conv_decoder(x2)
         out = self.conv_attn(out)
         return out * x2
-
 
 class SMAFormer(nn.Module):
     """Original author architecture, unchanged, except `n_classes` and
@@ -548,3 +537,23 @@ class SMAFormer(nn.Module):
         out = self.output_layer1(x8)
         out = self.output_layer2(out)
         return out
+
+
+# ----------------------------------------------------------------------
+# Baseline Upgrades: Normalization
+# ----------------------------------------------------------------------
+def _pick_num_groups(num_channels: int, target: int = 8) -> int:
+    for g in range(min(target, num_channels), 0, -1):
+        if num_channels % g == 0:
+            return g
+    return 1
+
+def replace_batchnorm_with_groupnorm(module: nn.Module, target_groups: int = 8) -> nn.Module:
+    for name, child in module.named_children():
+        if isinstance(child, nn.BatchNorm2d):
+            num_channels = child.num_features
+            num_groups = _pick_num_groups(num_channels, target_groups)
+            setattr(module, name, nn.GroupNorm(num_groups=num_groups, num_channels=num_channels))
+        else:
+            replace_batchnorm_with_groupnorm(child, target_groups)
+    return module
