@@ -1,5 +1,3 @@
-
-
 import argparse
 import os
 import csv
@@ -12,6 +10,10 @@ import torch.nn.functional as F
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import Dataset, DataLoader
 from torch.amp import autocast, GradScaler
+
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+from smaformer_core import replace_batchnorm_with_groupnorm
 
 from smaformer_vit_baseline import SMAFormerBaseline
 
@@ -50,81 +52,118 @@ def load_checkpoint(path, model, optimizer, scheduler, scaler):
     return ckpt["epoch"], ckpt["best_dice"]
 
 # ----------------------------------------------------------------------
-# Dataset (Unchanged)
+# Dataset (Upgraded with Albumentations)
 # ----------------------------------------------------------------------
-class ISIC2018Dataset(Dataset):
-    IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-    IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+def get_isic_train_transforms(img_size: int = 224):
+    return A.Compose([
+        A.Resize(img_size, img_size),
 
-    def __init__(self, image_paths, mask_paths, img_size=512, train=True):
-        assert len(image_paths) == len(mask_paths)
+        # --- mandatory tier ---
+        A.HorizontalFlip(p=0.5),
+        A.VerticalFlip(p=0.5),
+        A.RandomRotate90(p=0.5),          # dermoscopy has no canonical "up"
+        A.Affine(rotate=(-15, 15), scale=(0.9, 1.1), p=0.7),
+        A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05, p=0.5),
+
+        # --- recommended upgrade tier ---
+        A.ElasticTransform(alpha=1, sigma=20, p=0.2),
+        A.CLAHE(clip_limit=2.0, p=0.3),   # helps low-contrast / hair-obscured boundaries
+        A.CoarseDropout(num_holes_range=(1, 4), hole_height_range=(0.02, 0.08),
+                        hole_width_range=(0.02, 0.08), p=0.2),
+
+        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        ToTensorV2(),
+    ])
+
+def get_isic_val_transforms(img_size: int = 224):
+    return A.Compose([
+        A.Resize(img_size, img_size),
+        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        ToTensorV2(),
+    ])
+
+class ISIC2018Dataset(Dataset):
+    def __init__(self, image_paths, mask_paths, transform=None):
         self.image_paths = image_paths
         self.mask_paths = mask_paths
-        self.img_size = img_size
-        self.train = train
+        self.transform = transform
 
     def __len__(self):
         return len(self.image_paths)
 
-    def _load(self, path):
-        from PIL import Image
-        return Image.open(path)
-
     def __getitem__(self, idx):
         import numpy as np
         from PIL import Image
+        img = Image.open(self.image_paths[idx]).convert("RGB")
+        mask = Image.open(self.mask_paths[idx]).convert("L")
 
-        img = self._load(self.image_paths[idx]).convert("RGB").resize(
-            (self.img_size, self.img_size), Image.BILINEAR
-        )
-        mask = self._load(self.mask_paths[idx]).convert("L").resize(
-            (self.img_size, self.img_size), Image.NEAREST
-        )
+        img_np = np.array(img)
+        mask_np = np.array(mask, dtype=np.float32) / 255.0  
 
-        img = torch.from_numpy(np.array(img)).permute(2, 0, 1).float() / 255.0
-        mask = torch.from_numpy(np.array(mask)).float().unsqueeze(0) / 255.0
-        mask = (mask > 0.5).float()
+        if self.transform:
+            augmented = self.transform(image=img_np, mask=mask_np)
+            img_tensor = augmented['image']
+            mask_tensor = augmented['mask'].unsqueeze(0) 
+        else:
+            import torchvision.transforms.functional as TF
+            img_tensor = TF.to_tensor(img)
+            mask_tensor = TF.to_tensor(mask)
 
-        if self.train:
-            if torch.rand(1).item() < 0.5:
-                img = torch.flip(img, dims=[2])
-                mask = torch.flip(mask, dims=[2])
-            if torch.rand(1).item() < 0.5:
-                img = torch.flip(img, dims=[1])
-                mask = torch.flip(mask, dims=[1])
-            angle = (torch.rand(1).item() * 2 - 1) * 15.0
-            img = _rotate(img, angle, interpolation="bilinear")
-            mask = _rotate(mask, angle, interpolation="nearest")
-            mask = (mask > 0.5).float()
-
-        img = (img - self.IMAGENET_MEAN) / self.IMAGENET_STD
-        return img, mask
-
-def _rotate(tensor, angle_degrees, interpolation="bilinear"):
-    import torchvision.transforms.functional as TF
-    mode = TF.InterpolationMode.BILINEAR if interpolation == "bilinear" else TF.InterpolationMode.NEAREST
-    return TF.rotate(tensor, angle_degrees, interpolation=mode)
+        return img_tensor, mask_tensor
 
 # ----------------------------------------------------------------------
-# Loss & Metrics (Unchanged)
+# Loss & Metrics (Upgraded)
 # ----------------------------------------------------------------------
-class BCEDiceLoss(nn.Module):
-    def __init__(self, smooth: float = 1.0):
+class WeightedBCEDiceLoss(nn.Module):
+    def __init__(self, pos_weight: float = 4.0, dice_smooth: float = 1.0, bce_dice_ratio: float = 0.5):
         super().__init__()
-        self.smooth = smooth
-        self.bce = nn.BCEWithLogitsLoss()
+        self.register_buffer("pos_weight", torch.tensor(pos_weight))
+        self.dice_smooth = dice_smooth
+        self.bce_dice_ratio = bce_dice_ratio
 
     def forward(self, logits, targets):
-        bce_loss = self.bce(logits, targets)
+        bce = F.binary_cross_entropy_with_logits(logits, targets, pos_weight=self.pos_weight)
         probs = torch.sigmoid(logits)
-        probs_flat = probs.reshape(probs.size(0), -1)
-        targets_flat = targets.reshape(targets.size(0), -1)
+        probs_flat = probs.reshape(probs.size(0), -1).float()
+        targets_flat = targets.reshape(targets.size(0), -1).float()
         intersection = (probs_flat * targets_flat).sum(dim=1)
-        dice = (2 * intersection + self.smooth) / (
-            probs_flat.sum(dim=1) + targets_flat.sum(dim=1) + self.smooth
+        dice = (2 * intersection + self.dice_smooth) / (
+            probs_flat.sum(dim=1) + targets_flat.sum(dim=1) + self.dice_smooth
         )
         dice_loss = 1 - dice.mean()
-        return bce_loss + dice_loss
+        return self.bce_dice_ratio * bce + (1 - self.bce_dice_ratio) * dice_loss
+
+def compute_pos_weight(mask_paths) -> float:
+    import numpy as np
+    from PIL import Image
+    total_pos, total_pixels = 0, 0
+    for p in mask_paths:
+        m = np.array(Image.open(p).convert("L")) > 127
+        total_pos += m.sum()
+        total_pixels += m.size
+    total_neg = total_pixels - total_pos
+    return float(total_neg / max(total_pos, 1))
+
+class FocalTverskyLoss(nn.Module):
+    def __init__(self, alpha: float = 0.7, beta: float = 0.3, gamma: float = 0.75, smooth: float = 1.0):
+        super().__init__()
+        self.alpha = alpha
+        self.beta = beta
+        self.gamma = gamma
+        self.smooth = smooth
+
+    def forward(self, logits, targets):
+        probs = torch.sigmoid(logits)
+        probs_flat = probs.reshape(probs.size(0), -1).float()
+        targets_flat = targets.reshape(targets.size(0), -1).float()
+
+        tp = (probs_flat * targets_flat).sum(dim=1)
+        fn = ((1 - probs_flat) * targets_flat).sum(dim=1)
+        fp = (probs_flat * (1 - targets_flat)).sum(dim=1)
+
+        tversky = (tp + self.smooth) / (tp + self.alpha * fn + self.beta * fp + self.smooth)
+        loss = (1 - tversky).pow(self.gamma)
+        return loss.mean()
 
 @torch.no_grad()
 def binary_seg_metrics(logits, targets, threshold=0.5, smooth=1e-6):
@@ -236,8 +275,9 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    train_ds = ISIC2018Dataset(args.train_images, args.train_masks, img_size=args.img_size, train=True)
-    val_ds = ISIC2018Dataset(args.val_images, args.val_masks, img_size=args.img_size, train=False)
+    train_ds = ISIC2018Dataset(args.train_images, args.train_masks, transform=get_isic_train_transforms(args.img_size))
+    val_ds = ISIC2018Dataset(args.val_images, args.val_masks, transform=get_isic_val_transforms(args.img_size))
+    
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                                num_workers=args.num_workers, pin_memory=True, drop_last=True)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
@@ -250,9 +290,15 @@ def main():
         vit_name=args.vit_name,
         pretrained_vit=args.pretrained_vit,
         freeze_vit_blocks=args.freeze_vit_blocks,
-    ).to(device)
+    )
+    
+    # Apply GroupNorm fix BEFORE sending to device
+    model = replace_batchnorm_with_groupnorm(model, target_groups=8)
+    model = model.to(device)
 
-    criterion = BCEDiceLoss()
+    # 3. Upgrade Criterion (Using FocalTversky as Claude recommended)
+    criterion = FocalTverskyLoss(alpha=0.7, beta=0.3, gamma=0.75).to(device)
+
     optimizer = torch.optim.SGD(
         model.param_groups(base_lr=args.base_lr, vit_lr=args.vit_lr),
         momentum=args.momentum,
@@ -261,7 +307,6 @@ def main():
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.eta_min)
     scaler = GradScaler(enabled=(device.type == "cuda"))
 
-    # Auto-Resume Logic
     # Auto-Resume Logic
     start_epoch = args.start_epoch
     best_dice = 0.0
