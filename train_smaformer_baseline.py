@@ -264,7 +264,6 @@ def main():
     parser.add_argument("--pretrained_vit", action="store_true", default=True)
     parser.add_argument("--freeze_vit_blocks", type=int, default=8)
     parser.add_argument("--num_workers", type=int, default=2) # LOWERED TO 2 FOR STABILITY
-    parser.add_argument("--resume_weights", type=str, default="")
     parser.add_argument("--start_epoch", type=int, default=1)
     
     # Checkpoints now point to Google Drive natively
@@ -312,16 +311,10 @@ def main():
     best_dice = 0.0
     last_ckpt_path = os.path.join(args.out_dir, "last.pt")
     
-    if args.resume_weights != "" and os.path.exists(args.resume_weights):
-        print(f"🔄 Rescue mode! Loading clean weights from: {args.resume_weights}")
-        model.load_state_dict(torch.load(args.resume_weights, map_location=device))
-        best_dice = 0.3701  # Lock in the Epoch 4 score so it doesn't overwrite early
-        if os.path.exists(last_ckpt_path):
-            os.remove(last_ckpt_path)
-    elif os.path.exists(last_ckpt_path):
+    if os.path.exists(last_ckpt_path):
         print(f"🔄 Found interrupted run! Resuming from: {last_ckpt_path}")
         start_epoch, best_dice = load_checkpoint(last_ckpt_path, model, optimizer, scheduler, scaler)
-        start_epoch += 1 
+        start_epoch += 1
 
     # Setup CSV Logger
     csv_path = os.path.join(args.out_dir, "training_log.csv")
