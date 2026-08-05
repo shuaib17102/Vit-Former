@@ -29,10 +29,11 @@ class SMAFormerBaseline(SMAFormer):
         args=None,
         in_channels: int = 3,
         n_classes: int = 1,           # 1 for ISIC 2018 Task 1 binary lesion mask
-        img_size: int = 512,
+        img_size: int = 224,
         vit_name: str = "vit_base_patch16_224",
         pretrained_vit: bool = True,
         freeze_vit_blocks: int = 8,   # freeze first 8 of 12 blocks by default; see note below
+        per_channel_gate: bool = False,  # ablation option, see vit_gate below -- default preserves current scalar behavior
     ):
         super().__init__(args=args, in_channels=in_channels, n_classes=n_classes)
 
@@ -40,7 +41,7 @@ class SMAFormerBaseline(SMAFormer):
         self.vit_branch = ViTBottleneckBranch(
             vit_name=vit_name,
             img_size=img_size,
-            target_grid=img_size // 32,            # matches this SMAFormer's bottleneck grid at 512 input
+            target_grid=img_size // 32,            # matches SMAFormer's bottleneck grid at this resolution
             target_ch=self.filters[5], # 512
             pretrained=pretrained_vit,
             freeze_blocks=freeze_vit_blocks,
@@ -48,7 +49,16 @@ class SMAFormerBaseline(SMAFormer):
         # Zero-initialized gate: at step 0 the model is mathematically
         # identical to the vanilla SMAFormer forward pass. Training
         # decides how much (if any) of the ViT prior to pull in.
-        self.vit_gate = nn.Parameter(torch.zeros(1))
+        #
+        # Default is a single global scalar -- the model can only learn
+        # one mixing weight for the *entire* ViT contribution, it can't
+        # trust some of the 512 ViT-projected channels more than others.
+        # per_channel_gate=True switches to one learnable scalar per
+        # channel (still zero-init, same mathematical-identity-at-step-0
+        # guarantee) -- costs 512 extra parameters, worth trying as an
+        # ablation on top of the scalar baseline, not a required change.
+        gate_shape = (self.filters[5],) if per_channel_gate else (1,)
+        self.vit_gate = nn.Parameter(torch.zeros(gate_shape))
 
     def load_pretrained_vit_weights(self, vit_name: str = None, freeze_vit_blocks: int = None):
         """Re-download / re-load ImageNet ViT weights into the branch,
@@ -57,7 +67,6 @@ class SMAFormerBaseline(SMAFormer):
         Useful for resuming an experiment or trying a different ViT
         variant (vit_base_patch16_224, vit_large_patch16_224, a DINO or
         SAM-pretrained ViT-B via a different timm model name, etc.)."""
-        name = vit_name or self.vit_branch.vit.__class__.__name__
         name = vit_name if vit_name is not None else "vit_base_patch16_224"
         freeze = freeze_vit_blocks if freeze_vit_blocks is not None else 8
 
@@ -89,9 +98,9 @@ class SMAFormerBaseline(SMAFormer):
         x4 = self.patch_embedding3.PE(x3)  # [B, 49, 512]  (7x7 tokens at 224 input)
 
         # --- ViT fusion point ---
-        vit_feats = self.vit_branch(x)                              # [B, 512, 16, 16]
+        vit_feats = self.vit_branch(x)                              # [B, 512, 7, 7] at img_size=224
         b_v, c_v, h_v, w_v = vit_feats.shape
-        vit_tokens = vit_feats.view(b_v, c_v, h_v * w_v).permute(0, 2, 1)  # [B, 256, 512]
+        vit_tokens = vit_feats.view(b_v, c_v, h_v * w_v).permute(0, 2, 1).contiguous()  # [B, 49, 512]
         x4 = x4 + self.vit_gate * vit_tokens
         # --- end fusion ---
 
