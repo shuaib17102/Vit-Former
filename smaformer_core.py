@@ -60,8 +60,8 @@ class SDPAMultiheadAttention(nn.Module):
         # Critical: Explicitly scale by the original head_dim so temperature doesn't change
         scale = 1.0 / math.sqrt(self.head_dim)
 
-        # Strict allowlist: EFFICIENT and FLASH only. NO MATH backend allowed.
-        with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.FLASH_ATTENTION]):
+        # Allow Efficient, Flash, and Standard Math backends for full device compatibility
+        with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.FLASH_ATTENTION, SDPBackend.MATH]):
             attn_out = F.scaled_dot_product_attention(
                 q, k, v,
                 dropout_p=self.dropout if self.training else 0.0,
