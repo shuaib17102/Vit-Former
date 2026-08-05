@@ -3,6 +3,7 @@ import os
 import csv
 import random
 import numpy as np
+import cv2
 
 import torch
 import torch.nn as nn
@@ -13,6 +14,7 @@ from torch.amp import autocast, GradScaler
 
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
+import timm
 from smaformer_core import replace_batchnorm_with_groupnorm
 
 from smaformer_vit_baseline import SMAFormerBaseline
@@ -41,44 +43,78 @@ def save_checkpoint(path, model, optimizer, scheduler, scaler, epoch, best_dice)
         "scheduler": scheduler.state_dict(),
         "scaler": scaler.state_dict(),
         "best_dice": best_dice,
+        "rng_state": {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch_cpu": torch.get_rng_state(),
+            "torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        },
     }, path)
 
-def load_checkpoint(path, model, optimizer, scheduler, scaler):
-    ckpt = torch.load(path, map_location="cuda")
+def load_checkpoint(path, model, optimizer, scheduler, scaler, device):
+    # map_location must follow the actual runtime device -- hardcoding
+    # "cuda" crashes on any CPU-only resume of a GPU-trained checkpoint.
+    ckpt = torch.load(path, map_location=device)
     model.load_state_dict(ckpt["model"])
     optimizer.load_state_dict(ckpt["optimizer"])
     scheduler.load_state_dict(ckpt["scheduler"])
     scaler.load_state_dict(ckpt["scaler"])
+
+    rng_state = ckpt.get("rng_state")
+    if rng_state is not None:
+        random.setstate(rng_state["python"])
+        np.random.set_state(rng_state["numpy"])
+        # map_location remaps every tensor in the checkpoint (including RNG
+        # state) to `device` -- torch.set_rng_state requires a CPU ByteTensor,
+        # so this must be cast back before restoring.
+        torch.set_rng_state(rng_state["torch_cpu"].cpu())
+        if rng_state["torch_cuda"] is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all([t.cpu() for t in rng_state["torch_cuda"]])
+    else:
+        print("⚠️ No RNG state in checkpoint (older format) — resuming without restoring RNG streams.")
+
     return ckpt["epoch"], ckpt["best_dice"]
 
 # ----------------------------------------------------------------------
 # Dataset (Upgraded with Albumentations)
 # ----------------------------------------------------------------------
-def get_isic_train_transforms(img_size: int = 224):
+def get_vit_normalization_stats(vit_name: str):
+    """Derive mean/std from the actual ViT checkpoint's pretrained config
+    instead of assuming ImageNet stats. Different timm ViT-B/16 checkpoints
+    (e.g. inception-style vs. ImageNet-style backbones) expect different
+    normalization -- hardcoding one constant silently mismatches the
+    pretrained input distribution the moment --vit_name is changed."""
+    cfg = timm.data.resolve_data_config({}, model=timm.create_model(vit_name, pretrained=False))
+    return tuple(cfg["mean"]), tuple(cfg["std"])
+
+# Spatial transforms whose default interpolation would otherwise blur mask
+# edges into non-binary values; masks must always be resampled with nearest-
+# neighbor interpolation so they stay in {0.0, 1.0} after augmentation.
+def get_isic_train_transforms(img_size: int = 224, mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)):
     return A.Compose([
-        A.Resize(img_size, img_size),
+        A.Resize(img_size, img_size, mask_interpolation=cv2.INTER_NEAREST),
 
         # --- mandatory tier ---
         A.HorizontalFlip(p=0.5),
         A.VerticalFlip(p=0.5),
         A.RandomRotate90(p=0.5),          # dermoscopy has no canonical "up"
-        A.Affine(rotate=(-15, 15), scale=(0.9, 1.1), p=0.7),
+        A.Affine(rotate=(-15, 15), scale=(0.9, 1.1), p=0.7, mask_interpolation=cv2.INTER_NEAREST),
         A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05, p=0.5),
 
         # --- recommended upgrade tier ---
-        A.ElasticTransform(alpha=1, sigma=20, p=0.2),
+        A.ElasticTransform(alpha=1, sigma=20, p=0.2, mask_interpolation=cv2.INTER_NEAREST),
         A.CLAHE(clip_limit=2.0, p=0.3),   # helps low-contrast / hair-obscured boundaries
         A.CoarseDropout(num_holes_range=(1, 4), hole_height_range=(0.02, 0.08),
                         hole_width_range=(0.02, 0.08), p=0.2),
 
-        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        A.Normalize(mean=mean, std=std),
         ToTensorV2(),
     ])
 
-def get_isic_val_transforms(img_size: int = 224):
+def get_isic_val_transforms(img_size: int = 224, mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)):
     return A.Compose([
-        A.Resize(img_size, img_size),
-        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        A.Resize(img_size, img_size, mask_interpolation=cv2.INTER_NEAREST),
+        A.Normalize(mean=mean, std=std),
         ToTensorV2(),
     ])
 
@@ -98,12 +134,18 @@ class ISIC2018Dataset(Dataset):
         mask = Image.open(self.mask_paths[idx]).convert("L")
 
         img_np = np.array(img)
-        mask_np = np.array(mask, dtype=np.float32) / 255.0  
+        # Binarize at load time: source PNGs can carry anti-aliased edge
+        # values, so this must be a hard threshold, not just a /255 scale.
+        mask_np = (np.array(mask, dtype=np.float32) > 127.0).astype(np.float32)
 
         if self.transform:
             augmented = self.transform(image=img_np, mask=mask_np)
             img_tensor = augmented['image']
-            mask_tensor = augmented['mask'].unsqueeze(0) 
+            # Re-binarize post-augmentation as a defensive second pass --
+            # protects against any interpolation-introduced soft edges even
+            # if mask_interpolation is ever misconfigured or missing on a
+            # given Albumentations version.
+            mask_tensor = (augmented['mask'] > 0.5).float().unsqueeze(0)
         else:
             import torchvision.transforms.functional as TF
             img_tensor = TF.to_tensor(img)
@@ -143,6 +185,18 @@ def compute_pos_weight(mask_paths) -> float:
         total_pixels += m.size
     total_neg = total_pixels - total_pos
     return float(total_neg / max(total_pos, 1))
+
+def build_criterion(loss_name: str, train_mask_paths=None):
+    """Single switch for both losses so WeightedBCEDiceLoss + compute_pos_weight
+    are never silently dead code / never silently using a placeholder pos_weight."""
+    if loss_name == "focal_tversky":
+        return FocalTverskyLoss(alpha=0.7, beta=0.3, gamma=0.75)
+    elif loss_name == "bce_dice":
+        pos_weight = compute_pos_weight(train_mask_paths)
+        print(f"Computed pos_weight from training masks: {pos_weight:.4f}")
+        return WeightedBCEDiceLoss(pos_weight=pos_weight)
+    else:
+        raise ValueError(f"Unknown --loss '{loss_name}', expected 'focal_tversky' or 'bce_dice'")
 
 class FocalTverskyLoss(nn.Module):
     def __init__(self, alpha: float = 0.7, beta: float = 0.3, gamma: float = 0.75, smooth: float = 1.0):
@@ -193,13 +247,26 @@ def train_one_epoch(model, loader, optimizer, scaler, criterion, device, accumul
     optimizer.zero_grad(set_to_none=True)
     running_loss = 0.0
 
+    num_batches = len(loader)
+    remainder = num_batches % accumulation_steps
+    # Size of the final (possibly partial) accumulation group this epoch.
+    final_group_size = remainder if remainder != 0 else accumulation_steps
+    final_group_start = num_batches - final_group_size
+
     for step, (imgs, masks) in enumerate(loader):
         imgs, masks = imgs.to(device, non_blocking=True), masks.to(device, non_blocking=True)
-        
+
+        # Divide by the ACTUAL number of batches in the current accumulation
+        # group, not the fixed accumulation_steps -- otherwise, whenever
+        # num_batches isn't a clean multiple of accumulation_steps, the final
+        # partial group's gradients are under-scaled by
+        # (remainder / accumulation_steps) relative to every other step.
+        divisor = final_group_size if step >= final_group_start else accumulation_steps
+
         # Explicit fp16 for T4 Tensor Cores
         with autocast(device_type="cuda" if device.type == "cuda" else "cpu", dtype=torch.float16):
             logits = model(imgs)
-            loss = criterion(logits, masks) / accumulation_steps
+            loss = criterion(logits, masks) / divisor
             
         scaler.scale(loss).backward()
         
@@ -212,34 +279,41 @@ def train_one_epoch(model, loader, optimizer, scaler, criterion, device, accumul
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
             
-        running_loss += loss.item() * accumulation_steps
+        running_loss += loss.item() * divisor
 
     # FLUSH: Process any remaining gradients at the end of the epoch
-    if len(loader) % accumulation_steps != 0:
+    if remainder != 0:
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         scaler.step(optimizer)
         scaler.update()
         optimizer.zero_grad(set_to_none=True)
 
-    return running_loss / len(loader)
+    return running_loss / num_batches
 
 @torch.no_grad()
 def validate(model, loader, criterion, device, threshold=0.5):
     model.eval()
-    running_loss = 0.0
+    total_loss = 0.0
+    total_samples = 0
     agg = {"dice": 0.0, "iou": 0.0, "precision": 0.0, "recall": 0.0}
     for imgs, masks in loader:
         imgs, masks = imgs.to(device), masks.to(device)
+        batch_size = imgs.size(0)
         with autocast(device_type="cuda" if device.type == "cuda" else "cpu", dtype=torch.float16):
             logits = model(imgs)
             loss = criterion(logits, masks)
-        running_loss += loss.item()
+        # binary_seg_metrics already returns a per-batch mean over samples,
+        # so weighting each batch's contribution by batch_size and dividing
+        # by total_samples gives a correct sample-weighted average -- val_loader
+        # has no drop_last, so the final batch can be smaller and must not
+        # count equally with full batches.
+        total_loss += loss.item() * batch_size
         m = binary_seg_metrics(logits, masks, threshold=threshold)
         for k in agg:
-            agg[k] += m[k]
-    n = len(loader)
-    return running_loss / n, {k: v / n for k, v in agg.items()}
+            agg[k] += m[k] * batch_size
+        total_samples += batch_size
+    return total_loss / total_samples, {k: v / total_samples for k, v in agg.items()}
 
 # ----------------------------------------------------------------------
 # Main Loop (Upgraded)
@@ -261,8 +335,12 @@ def main():
     parser.add_argument("--momentum", type=float, default=0.98)
     parser.add_argument("--weight_decay", type=float, default=1e-6)
     parser.add_argument("--vit_name", type=str, default="vit_base_patch16_224")
-    parser.add_argument("--pretrained_vit", action="store_true", default=True)
+    # BooleanOptionalAction allows --no-pretrained_vit; the previous
+    # action="store_true", default=True combination could never be set to
+    # False from the CLI, making a from-scratch-ViT ablation unreachable.
+    parser.add_argument("--pretrained_vit", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--freeze_vit_blocks", type=int, default=8)
+    parser.add_argument("--loss", type=str, choices=["focal_tversky", "bce_dice"], default="focal_tversky")
     parser.add_argument("--num_workers", type=int, default=2) # LOWERED TO 2 FOR STABILITY
     parser.add_argument("--start_epoch", type=int, default=1)
     
@@ -274,8 +352,15 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    train_ds = ISIC2018Dataset(args.train_images, args.train_masks, transform=get_isic_train_transforms(args.img_size))
-    val_ds = ISIC2018Dataset(args.val_images, args.val_masks, transform=get_isic_val_transforms(args.img_size))
+    # Derive normalization stats from the actual ViT checkpoint rather than
+    # assuming ImageNet mean/std, so a --vit_name swap can't silently
+    # mismatch the pretrained backbone's expected input distribution.
+    vit_mean, vit_std = get_vit_normalization_stats(args.vit_name)
+
+    train_ds = ISIC2018Dataset(args.train_images, args.train_masks,
+                                transform=get_isic_train_transforms(args.img_size, mean=vit_mean, std=vit_std))
+    val_ds = ISIC2018Dataset(args.val_images, args.val_masks,
+                              transform=get_isic_val_transforms(args.img_size, mean=vit_mean, std=vit_std))
     
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                                num_workers=args.num_workers, pin_memory=True, drop_last=True)
@@ -295,8 +380,9 @@ def main():
     model = replace_batchnorm_with_groupnorm(model, target_groups=8)
     model = model.to(device)
 
-    # 3. Upgrade Criterion (Using FocalTversky as Claude recommended)
-    criterion = FocalTverskyLoss(alpha=0.7, beta=0.3, gamma=0.75).to(device)
+    # 3. Criterion selected via --loss, so WeightedBCEDiceLoss + compute_pos_weight
+    # are actually reachable instead of being permanently dead code.
+    criterion = build_criterion(args.loss, train_mask_paths=args.train_masks).to(device)
 
     optimizer = torch.optim.SGD(
         model.param_groups(base_lr=args.base_lr, vit_lr=args.vit_lr),
@@ -313,7 +399,7 @@ def main():
     
     if os.path.exists(last_ckpt_path):
         print(f"🔄 Found interrupted run! Resuming from: {last_ckpt_path}")
-        start_epoch, best_dice = load_checkpoint(last_ckpt_path, model, optimizer, scheduler, scaler)
+        start_epoch, best_dice = load_checkpoint(last_ckpt_path, model, optimizer, scheduler, scaler, device)
         start_epoch += 1
 
     # Setup CSV Logger
