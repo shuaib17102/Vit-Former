@@ -237,6 +237,23 @@ class Modulator(nn.Module):
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
 
+    def freeze_pe_only_params(self):
+        """Call this on a Modulator instance that is only ever used via
+        .PE() (that's patch_embedding1/2/3 in SMAFormer -- .forward() is
+        never called on them). PE() only touches pj_conv/pos_conv/sigmoid/
+        layernorm; everything else (CA_fc, PA_conv, PA_bn, SA_blocks,
+        SA_out_conv, output_conv, norm, self.bias) is allocated and
+        trainable but never exercised in the forward pass. Freezing them
+        doesn't change any output (they were already unused) -- it just
+        stops wasted gradient computation and keeps trainable-parameter
+        counts (e.g. for a paper's parameter table) honest. Do NOT call
+        this on SMA's own combined_modulator -- that one genuinely uses
+        the full forward() path."""
+        for m in (self.CA_fc, self.PA_conv, self.PA_bn, self.SA_blocks,
+                  self.SA_out_conv, self.output_conv, self.norm):
+            m.requires_grad_(False)
+        self.bias.requires_grad_(False)
+
 class SMA(nn.Module):
     def __init__(self, feature_size, num_heads, dropout):
         super(SMA, self).__init__()
@@ -248,7 +265,7 @@ class SMA(nn.Module):
         MSA = self.attention(query, key, value)[0]
         batch_size, seq_len, feature_size = MSA.shape
         MSA = MSA.permute(0, 2, 1).view(batch_size, feature_size, math.isqrt(seq_len), math.isqrt(seq_len))
-        synergistic_attn = self.combined_modulator.forward(MSA)
+        synergistic_attn = self.combined_modulator(MSA)  # fixed: was .forward(MSA), bypassed __call__/hooks
         x = synergistic_attn.view(batch_size, feature_size, -1).permute(0, 2, 1)
         return x
 
@@ -307,6 +324,17 @@ class SMAFormerBlock(nn.Module):
         self.e_mlp = E_MLP(ch_out, forward_expansion, dropout)
         self.fusion_gate = fusion_gate
         self.dropout = nn.Dropout(dropout) if dropout > 0. else nn.Identity()
+        if fusion_gate:
+            # Every EncoderBlock/DecoderBlock in SMAFormer.__init__ passes
+            # fusion_gate=True, which means forward() below only ever takes
+            # the self.synergistic_multi_attention branch -- self.MSA (a full
+            # SDPAMultiheadAttention + its own Modulator) is allocated and
+            # trainable but never called. This is beyond what the audit
+            # flagged (it only caught MSA's internal combined_modulator as
+            # dead) -- the whole MSA submodule is dead when fusion_gate=True.
+            # Freezing it doesn't change any output; it just stops wasted
+            # gradient computation and keeps trainable-parameter counts honest.
+            self.MSA.requires_grad_(False)
 
     def forward(self, value, key, query, res):
         if self.fusion_gate:
@@ -431,16 +459,19 @@ class SMAFormer(nn.Module):
         )
 
         self.patch_embedding1 = Modulator(in_ch=filters[0], out_ch=filters[1])
+        self.patch_embedding1.freeze_pe_only_params()
         self.EncoderBlock1 = EncoderBlock(in_ch=filters[1], out_ch=filters[1], heads=8, dropout=0.1,
                                            forward_expansion=2, num_layers=encoder_layer, fusion_gate=True)
         self.residual_conv1 = ResidualConv(filters[1], filters[2], 2, 1)
 
         self.patch_embedding2 = Modulator(in_ch=filters[2], out_ch=filters[3])
+        self.patch_embedding2.freeze_pe_only_params()
         self.EncoderBlock2 = EncoderBlock(in_ch=filters[3], out_ch=filters[3], heads=8, dropout=0.1,
                                            forward_expansion=2, num_layers=encoder_layer, fusion_gate=True)
         self.residual_conv2 = ResidualConv(filters[3], filters[4], 2, 1)
 
         self.patch_embedding3 = Modulator(in_ch=filters[4], out_ch=filters[5])
+        self.patch_embedding3.freeze_pe_only_params()
         self.EncoderBlock3 = EncoderBlock(in_ch=filters[5], out_ch=filters[5], heads=8, dropout=0.1,
                                            forward_expansion=2, num_layers=encoder_layer, fusion_gate=True)
         self.EncoderBlock4 = EncoderBlock(in_ch=filters[5], out_ch=filters[5], heads=8, dropout=0.1,
@@ -469,6 +500,13 @@ class SMAFormer(nn.Module):
         self.output_layer2 = nn.Sequential(nn.Conv2d(filters[0], n_classes, 1))
 
     def forward(self, x):
+        assert x.shape[-2] == x.shape[-1] and x.shape[-2] % 32 == 0, (
+            f"SMAFormer requires a square input whose side length is divisible by 32 "
+            f"(5 stride-2 stages downsample to H/32); got {tuple(x.shape[-2:])}. A "
+            f"non-square crop or a size that doesn't divide evenly by 32 will silently "
+            f"produce mismatched concat shapes deep in the decoder instead of failing "
+            f"here, which is a much worse debugging experience."
+        )
         x1 = self.input_layer(x) + self.input_skip(x)
 
         x2 = self.patch_embedding1.PE(x1)
