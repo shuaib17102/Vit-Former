@@ -187,10 +187,19 @@ class Modulator(nn.Module):
         res = x
         pa = self.PA(x)
         ca = self.CA(x)
-
-        pa_ca = torch.softmax(pa @ ca, dim=-1)
         sa = self.SA(x)
-        out = pa_ca @ sa
+
+        # FIX (was: torch.softmax(pa @ ca, dim=-1) @ sa): pa and ca are both
+        # smooth, high-similarity versions of the same x, so pa @ ca (a real
+        # H x W matrix multiply, batched per-channel) produces low-variance
+        # rows. Softmax over a low-variance row saturates toward uniform,
+        # which turns the second matmul into a near-identical column-average
+        # of sa applied to every row -- i.e. it destroys spatial content and
+        # produces vertical-banding artifacts. Confirmed via layer-by-layer
+        # isolation testing (see audit notes). Elementwise gating is the
+        # conventional pixel/channel-attention fusion this module intends.
+        fused_attn = torch.sigmoid(pa * ca)
+        out = fused_attn * sa
         out = self.norm(self.output_conv(out))
         out = out + self.bias
         synergistic_attn = out + res
