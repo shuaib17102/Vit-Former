@@ -332,7 +332,11 @@ def main():
     parser.add_argument("--val_images", nargs="+", required=True)
     parser.add_argument("--val_masks", nargs="+", required=True)
 
-    parser.add_argument("--img_size", type=int, default=512)
+    # Default matches SMAFormerBaseline's own default and this project's
+    # actual training resolution -- 512 was an earlier value that no longer
+    # matches any other default in the codebase (see vit_bottleneck_branch.py's
+    # docstring note on why a stale resolution constant is dangerous here).
+    parser.add_argument("--img_size", type=int, default=224)
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--accumulation_steps", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=30)
