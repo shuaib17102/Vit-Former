@@ -141,11 +141,19 @@ class ColAttention(nn.Module):
         return out
 
 class Modulator(nn.Module):
-    def __init__(self, in_ch, out_ch, with_pos=True):
+    def __init__(self, in_ch, out_ch, with_pos=True, dilation_rates=None):
         super(Modulator, self).__init__()
         self.in_ch = in_ch
         self.out_ch = out_ch
-        self.rate = [1, 6, 12, 18]
+        # Default rates are tuned for larger feature maps. At small spatial
+        # resolutions (e.g. a 7x7 bottleneck), dilation 12/18 exceeds the
+        # map size -- most kernel taps land in zero-padding, and which
+        # positions get a valid off-center tap depends on position modulo
+        # dilation rate, producing an oscillating, input-independent banding
+        # pattern (confirmed via isolation probe testing) instead of a useful
+        # multi-scale receptive field. Callers at small resolutions should
+        # pass a smaller dilation_rates list explicitly.
+        self.rate = dilation_rates if dilation_rates is not None else [1, 6, 12, 18]
         self.with_pos = with_pos
         self.patch_size = 2
         self.bias = nn.Parameter(torch.zeros(1, out_ch, 1, 1))
@@ -264,10 +272,10 @@ class Modulator(nn.Module):
         self.bias.requires_grad_(False)
 
 class SMA(nn.Module):
-    def __init__(self, feature_size, num_heads, dropout):
+    def __init__(self, feature_size, num_heads, dropout, dilation_rates=None):
         super(SMA, self).__init__()
         self.attention = SDPAMultiheadAttention(feature_size, num_heads, dropout)
-        self.combined_modulator = Modulator(feature_size, feature_size)
+        self.combined_modulator = Modulator(feature_size, feature_size, dilation_rates=dilation_rates)
         self.dropout = nn.Dropout(dropout) if dropout > 0. else nn.Identity()
 
     def forward(self, value, key, query):
@@ -279,10 +287,10 @@ class SMA(nn.Module):
         return x
 
 class MSA(nn.Module):
-    def __init__(self, feature_size, num_heads, dropout):
+    def __init__(self, feature_size, num_heads, dropout, dilation_rates=None):
         super(MSA, self).__init__()
         self.attention = SDPAMultiheadAttention(feature_size, num_heads, dropout)
-        self.combined_modulator = Modulator(feature_size, feature_size)
+        self.combined_modulator = Modulator(feature_size, feature_size, dilation_rates=dilation_rates)
 
     def forward(self, value, key, query):
         attention = self.attention(query, key, value)[0]
@@ -324,12 +332,12 @@ class E_MLP(nn.Module):
         return out
 
 class SMAFormerBlock(nn.Module):
-    def __init__(self, ch_in, ch_out, heads, dropout, forward_expansion, fusion_gate):
+    def __init__(self, ch_in, ch_out, heads, dropout, forward_expansion, fusion_gate, dilation_rates=None):
         super(SMAFormerBlock, self).__init__()
         self.norm1 = nn.LayerNorm(ch_out)
         self.norm2 = nn.LayerNorm(ch_out)
-        self.MSA = MSA(ch_out, heads, dropout)
-        self.synergistic_multi_attention = SMA(ch_out, heads, dropout)
+        self.MSA = MSA(ch_out, heads, dropout, dilation_rates=dilation_rates)
+        self.synergistic_multi_attention = SMA(ch_out, heads, dropout, dilation_rates=dilation_rates)
         self.e_mlp = E_MLP(ch_out, forward_expansion, dropout)
         self.fusion_gate = fusion_gate
         self.dropout = nn.Dropout(dropout) if dropout > 0. else nn.Identity()
@@ -356,10 +364,11 @@ class SMAFormerBlock(nn.Module):
         return out
 
 class EncoderBlock(nn.Module):
-    def __init__(self, in_ch, out_ch, heads, dropout, forward_expansion, num_layers, fusion_gate):
+    def __init__(self, in_ch, out_ch, heads, dropout, forward_expansion, num_layers, fusion_gate, dilation_rates=None):
         super(EncoderBlock, self).__init__()
         self.layers = nn.ModuleList([
-            SMAFormerBlock(in_ch, out_ch, heads, dropout, forward_expansion, fusion_gate) for _ in range(num_layers)
+            SMAFormerBlock(in_ch, out_ch, heads, dropout, forward_expansion, fusion_gate,
+                           dilation_rates=dilation_rates) for _ in range(num_layers)
         ])
         self.in_ch = in_ch
         self.out_ch = out_ch
@@ -370,10 +379,11 @@ class EncoderBlock(nn.Module):
         return x
 
 class DecoderBlock(nn.Module):
-    def __init__(self, in_ch, out_ch, heads, dropout, forward_expansion, num_layers, fusion_gate):
+    def __init__(self, in_ch, out_ch, heads, dropout, forward_expansion, num_layers, fusion_gate, dilation_rates=None):
         super(DecoderBlock, self).__init__()
         self.layers = nn.ModuleList([
-            SMAFormerBlock(in_ch, out_ch, heads, dropout, forward_expansion, fusion_gate) for _ in range(num_layers)
+            SMAFormerBlock(in_ch, out_ch, heads, dropout, forward_expansion, fusion_gate,
+                           dilation_rates=dilation_rates) for _ in range(num_layers)
         ])
         self.in_ch = in_ch
         self.out_ch = out_ch
@@ -467,6 +477,16 @@ class SMAFormer(nn.Module):
             nn.Conv2d(in_channels, filters[0], kernel_size=3, padding=1)
         )
 
+        # Dilation rates [1,6,12,18] were only confirmed safe at the H/2
+        # resolution (EncoderBlock1/DecoderBlock4). At smaller resolutions
+        # (H/8 and below), rates of 12/18 exceed the feature map size and
+        # produce input-independent oscillating banding instead of useful
+        # multi-scale context (confirmed via isolation probe testing at the
+        # 7x7 bottleneck; H/8 and H/16 stages were not individually probed
+        # but share the same structural risk, so they use the same reduced
+        # rate set out of caution rather than assuming they're fine).
+        SMALL_DILATION_RATES = [1, 2, 3]
+
         self.patch_embedding1 = Modulator(in_ch=filters[0], out_ch=filters[1])
         self.patch_embedding1.freeze_pe_only_params()
         self.EncoderBlock1 = EncoderBlock(in_ch=filters[1], out_ch=filters[1], heads=8, dropout=0.1,
@@ -476,28 +496,34 @@ class SMAFormer(nn.Module):
         self.patch_embedding2 = Modulator(in_ch=filters[2], out_ch=filters[3])
         self.patch_embedding2.freeze_pe_only_params()
         self.EncoderBlock2 = EncoderBlock(in_ch=filters[3], out_ch=filters[3], heads=8, dropout=0.1,
-                                           forward_expansion=2, num_layers=encoder_layer, fusion_gate=True)
+                                           forward_expansion=2, num_layers=encoder_layer, fusion_gate=True,
+                                           dilation_rates=SMALL_DILATION_RATES)
         self.residual_conv2 = ResidualConv(filters[3], filters[4], 2, 1)
 
         self.patch_embedding3 = Modulator(in_ch=filters[4], out_ch=filters[5])
         self.patch_embedding3.freeze_pe_only_params()
         self.EncoderBlock3 = EncoderBlock(in_ch=filters[5], out_ch=filters[5], heads=8, dropout=0.1,
-                                           forward_expansion=2, num_layers=encoder_layer, fusion_gate=True)
+                                           forward_expansion=2, num_layers=encoder_layer, fusion_gate=True,
+                                           dilation_rates=SMALL_DILATION_RATES)
         self.EncoderBlock4 = EncoderBlock(in_ch=filters[5], out_ch=filters[5], heads=8, dropout=0.1,
-                                           forward_expansion=2, num_layers=encoder_layer, fusion_gate=True)
+                                           forward_expansion=2, num_layers=encoder_layer, fusion_gate=True,
+                                           dilation_rates=SMALL_DILATION_RATES)
 
         self.DecoderBlock1 = DecoderBlock(in_ch=filters[5], out_ch=filters[5], heads=8, dropout=0.1,
-                                           forward_expansion=2, num_layers=decoder_layer, fusion_gate=True)
+                                           forward_expansion=2, num_layers=decoder_layer, fusion_gate=True,
+                                           dilation_rates=SMALL_DILATION_RATES)
 
         self.upsample = Upsample_(2)
         self.upsample_transpose1 = Upsample_Transpose(filters[5], filters[4], kernel=2, stride=2)
         self.DecoderBlock2 = DecoderBlock(in_ch=filters[5], out_ch=filters[5], heads=8, dropout=0.,
-                                           forward_expansion=2, num_layers=decoder_layer, fusion_gate=True)
+                                           forward_expansion=2, num_layers=decoder_layer, fusion_gate=True,
+                                           dilation_rates=SMALL_DILATION_RATES)
 
         self.upsample_transpose2 = Upsample_Transpose(filters[5], filters[4], kernel=2, stride=2)
         self.upsample_transpose3 = Upsample_Transpose(filters[4] + filters[3], filters[3], kernel=1, stride=1)
         self.DecoderBlock3 = DecoderBlock(in_ch=filters[3], out_ch=filters[3], heads=8, dropout=0.1,
-                                           forward_expansion=2, num_layers=decoder_layer, fusion_gate=True)
+                                           forward_expansion=2, num_layers=decoder_layer, fusion_gate=True,
+                                           dilation_rates=SMALL_DILATION_RATES)
 
         self.upsample_transpose4 = Upsample_Transpose(filters[3], filters[2], kernel=2, stride=2)
         self.upsample_transpose5 = Upsample_Transpose(filters[3], filters[2], kernel=2, stride=2)
